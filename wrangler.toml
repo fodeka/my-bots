@@ -1,0 +1,4 @@
+toml
+name = "my-bots"
+main = "src/index.ts"
+compatibility_date = "2024-03-01"

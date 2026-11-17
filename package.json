@@ -1,7 +1,13 @@
 {
-  "name": "telegram-bot",
+  "name": "split-bill-bot",
   "version": "1.0.0",
+  "description": "Telegram bot for splitting bills",
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "tsx src/index.ts"
+  },
   "dependencies": {
-    "grammy": "^1.21.1"
+    "grammy": "^1.21.1",
+    "tsx": "^4.7.1"
   }
 }

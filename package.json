@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "grammy": "^1.21.1",
-    "tsx": "^4.7.1"
+    "tsx": "^4.7.1",
+    "@grammyjs/storage-file": "^2.6.0"
   }
 }

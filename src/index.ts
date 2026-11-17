@@ -1,17 +1,13 @@
-import { Bot, webhookCallback } from "grammy";
+import { Bot } from "grammy";
 
-export interface Env {
-  BOT_TOKEN: string;
-}
+// Создаем бота. Токен берется из переменных окружения FadeHost
+const bot = new Bot(process.env.BOT_TOKEN || "");
 
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const bot = new Bot(env.BOT_TOKEN || "");
+// Обработчик текстовых сообщений (Эхо-бот)
+bot.on("message:text", async (ctx) => {
+  await ctx.reply(ctx.message.text);
+});
 
-    bot.on("message:text", async (ctx) => {
-      await ctx.reply(ctx.message.text);
-    });
-
-    return webhookCallback(bot, "cloudflare-mod")(request);
-  },
-};
+// Запуск бота через Long Polling
+console.log("Бот запущен и слушает сообщения...");
+bot.start();

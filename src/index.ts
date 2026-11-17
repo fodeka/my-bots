@@ -3,10 +3,8 @@ import { Bot, Context, session } from "grammy";
 import { FileAdapter } from "@grammyjs/storage-file";
 import { join } from "path";
 
-// Администратор бота
 const ADMIN_USERNAME = "KlementyevDenis";
 
-// Структура расхода
 interface Expense {
   id: number;
   amount: number;
@@ -17,13 +15,11 @@ interface Expense {
   source: "auto" | "add" | "import";
 }
 
-// Участники чата
 interface KnownUser {
   userId: number;
   username: string;
 }
 
-// Общие данные чата
 interface SessionData {
   expenses: Expense[];
   knownUsers: KnownUser[];
@@ -37,12 +33,11 @@ type MyContext = Context & {
 const token = process.env.BOT_TOKEN;
 
 if (!token) {
-  throw new Error("Не задан BOT_TOKEN в переменных окружения");
+  throw new Error("Не задан BOT_TOKEN");
 }
 
 const bot = new Bot<MyContext>(token);
 
-// Файловое хранилище
 bot.use(
   session({
     initial: (): SessionData => ({
@@ -57,7 +52,40 @@ bot.use(
   })
 );
 
-// Вспомогательные функции
+// Миграция старых данных
+bot.use(async (ctx, next) => {
+  if (ctx.session) {
+    const data = ctx.session as SessionData;
+
+    if (!Array.isArray(data.expenses)) {
+      data.expenses = [];
+    }
+
+    if (!Array.isArray(data.knownUsers)) {
+      data.knownUsers = [];
+    }
+
+    data.expenses.forEach((expense, index) => {
+      if (!expense.id) expense.id = index + 1;
+      if (!expense.createdAt) {
+        expense.createdAt = new Date().toISOString();
+      }
+      if (!expense.source) expense.source = "auto";
+    });
+
+    const maxId = data.expenses.reduce(
+      (max, expense) => Math.max(max, expense.id),
+      0
+    );
+
+    if (!data.nextId || data.nextId <= maxId) {
+      data.nextId = maxId + 1;
+    }
+  }
+
+  await next();
+});
+
 function formatMoney(amount: number): string {
   return new Intl.NumberFormat("ru-RU", {
     minimumFractionDigits: 0,
@@ -70,47 +98,25 @@ function getName(username: string): string {
 }
 
 function isAdmin(ctx: MyContext): boolean {
-  return (
-    ctx.from?.username?.toLowerCase() ===
-    ADMIN_USERNAME.toLowerCase()
-  );
+  return ctx.from?.username?.toLowerCase() ===
+    ADMIN_USERNAME.toLowerCase();
 }
 
-function findUser(
-  session: SessionData,
-  username: string
-): KnownUser | undefined {
-  const normalized = username.replace(/^@/, "").toLowerCase();
+function parseExpense(text: string) {
+  const match = text.trim().match(/^(\d+(?:[.,]\d+)?)\s+(.+)$/);
 
-  return session.knownUsers.find(
-    (user) => user.username.replace(/^@/, "").toLowerCase() === normalized
-  );
-}
+  if (!match) return null;
 
-// Запоминание всех участников, написавших хотя бы одно сообщение
-bot.use(async (ctx, next) => {
-  if (ctx.from && ctx.chat) {
-    const userId = ctx.from.id;
-    const username = ctx.from.username || ctx.from.first_name || String(userId);
+  const amount = Number(match[1].replace(",", "."));
+  const description = match[2].trim();
 
-    const existing = ctx.session.knownUsers.find(
-      (user) => user.userId === userId
-    );
-
-    if (existing) {
-      existing.username = username;
-    } else {
-      ctx.session.knownUsers.push({
-        userId,
-        username,
-      });
-    }
+  if (!Number.isFinite(amount) || amount <= 0 || !description) {
+    return null;
   }
 
-  await next();
-});
+  return { amount, description };
+}
 
-// Добавление расхода
 function addExpense(
   ctx: MyContext,
   amount: number,
@@ -130,71 +136,60 @@ function addExpense(
   };
 
   ctx.session.expenses.push(expense);
-
   return expense;
 }
 
-// Проверка формата суммы и описания
-function parseExpense(text: string): {
-  amount: number;
-  description: string;
-} | null {
-  const match = text.trim().match(/^(\d+(?:[.,]\d+)?)\s+(.+)$/);
+// Запоминаем участников
+bot.use(async (ctx, next) => {
+  if (ctx.from && ctx.chat) {
+    const userId = ctx.from.id;
+    const username = ctx.from.username ||
+      ctx.from.first_name || String(userId);
 
-  if (!match) return null;
+    const existing = ctx.session.knownUsers.find(
+      user => user.userId === userId
+    );
 
-  const amount = Number(match[1].replace(",", "."));
-  const description = match[2].trim();
-
-  if (!Number.isFinite(amount) || amount <= 0 || !description) {
-    return null;
+    if (existing) {
+      existing.username = username;
+    } else {
+      ctx.session.knownUsers.push({ userId, username });
+    }
   }
 
-  return { amount, description };
-}
+  await next();
+});
 
 // /start
-bot.command("start", async (ctx) => {
+bot.command("start", async ctx => {
   await ctx.reply(
     "Привет! Я бот для учёта общих расходов.\n\n" +
-      "Просто отправляй сообщение в формате:\n" +
-      "100 Такси\n\n" +
-      "Я запишу расход автоматически.\n\n" +
-      "Команда /help — список возможностей."
+    "Просто отправляй сообщение:\n100 Такси\n\n" +
+    "Команда /help — список возможностей."
   );
 });
 
 // /help
-bot.command("help", async (ctx) => {
+bot.command("help", async ctx => {
   await ctx.reply(
     "📋 Команды бота:\n\n" +
-      "Автоматическая запись:\n" +
-      "100 Такси\n" +
-      "1500 Продукты\n\n" +
-      "Добавить расход:\n" +
-      "/add 500 Такси\n\n" +
-      "Посмотреть взаиморасчёты:\n" +
-      "/balance\n\n" +
-      "История расходов:\n" +
-      "/list\n\n" +
-      "Отменить последнюю запись (админ):\n" +
-      "/undo\n\n" +
-      "Сбросить расходы (админ):\n" +
-      "/reset\n\n" +
-      "Импортировать чужой расход (админ):\n" +
-      "/import @username 500 Такси\n\n" +
-      "Обычные сообщения бот игнорирует."
+    "Автоматическая запись: 100 Такси\n" +
+    "Добавить: /add 500 Такси\n" +
+    "Импорт: /import @username 500 Такси\n" +
+    "Расчёт: /balance\n" +
+    "История: /list\n" +
+    "Отмена последней записи: /undo\n" +
+    "Сброс расходов: /reset\n\n" +
+    "Обычные сообщения игнорируются."
   );
 });
 
 // /add
-bot.command("add", async (ctx) => {
+bot.command("add", async ctx => {
   const parsed = parseExpense(ctx.match);
 
   if (!parsed) {
-    return ctx.reply(
-      "Неверный формат.\nПример: /add 500 Такси"
-    );
+    return ctx.reply("Пример: /add 500 Такси");
   }
 
   const expense = addExpense(
@@ -208,14 +203,14 @@ bot.command("add", async (ctx) => {
 
   await ctx.reply(
     `✅ Записал: ${getName(expense.username)} — ` +
-      `${formatMoney(expense.amount)} (${expense.description})`
+    `${formatMoney(expense.amount)} (${expense.description})`
   );
 });
 
-// /import — импорт расхода другого участника
-bot.command("import", async (ctx) => {
+// /import
+bot.command("import", async ctx => {
   if (!isAdmin(ctx)) {
-    return ctx.reply("⛔ Эта команда доступна только администратору.");
+    return ctx.reply("⛔ Команда доступна только администратору.");
   }
 
   const match = ctx.match.trim().match(
@@ -223,20 +218,21 @@ bot.command("import", async (ctx) => {
   );
 
   if (!match) {
-    return ctx.reply(
-      "Неверный формат.\nПример: /import @username 500 Такси"
-    );
+    return ctx.reply("Пример: /import @username 500 Такси");
   }
 
-  const username = match[1].replace(/^@/, "");
+  const username = match[1].replace("@", "");
   const amount = Number(match[2].replace(",", "."));
   const description = match[3].trim();
 
   if (!Number.isFinite(amount) || amount <= 0 || !description) {
-    return ctx.reply("⛔ Проверьте сумму и описание расхода.");
+    return ctx.reply("⛔ Проверьте сумму и описание.");
   }
 
-  const user = findUser(ctx.session, username);
+  const user = ctx.session.knownUsers.find(
+    u => u.username.replace("@", "").toLowerCase() ===
+      username.toLowerCase()
+  );
 
   const expense = addExpense(
     ctx,
@@ -249,61 +245,52 @@ bot.command("import", async (ctx) => {
 
   await ctx.reply(
     `✅ Импортировано: ${getName(expense.username)} — ` +
-      `${formatMoney(expense.amount)} (${expense.description})` +
-      (user ? "" : "\n⚠️ Участник пока не найден в списке чата.")
+    `${formatMoney(expense.amount)} (${expense.description})` +
+    (user ? "" : "\n⚠️ Участник не найден в списке чата.")
   );
 });
 
-// /list — история расходов
-bot.command("list", async (ctx) => {
+// /list
+bot.command("list", async ctx => {
   const expenses = ctx.session.expenses;
 
-  if (expenses.length === 0) {
+  if (!expenses.length) {
     return ctx.reply("Список трат пуст.");
   }
 
-  const lines = expenses.map((expense) => {
-    const imported = expense.source === "import" ? " (+импорт)" : "";
-
-    return (
-      `${expense.id}. ${getName(expense.username)}: ` +
-      `${formatMoney(expense.amount)} — ${expense.description}${imported}`
-    );
-  });
-
-  const total = expenses.reduce(
-    (sum, expense) => sum + expense.amount,
-    0
+  const lines = expenses.map(e =>
+    `${e.id}. ${getName(e.username)}: ${formatMoney(e.amount)} — ` +
+    `${e.description}${e.source === "import" ? " (+импорт)" : ""}`
   );
+
+  const total = expenses.reduce((sum, e) => sum + e.amount, 0);
 
   await ctx.reply(
     "📋 История расходов:\n\n" +
-      lines.join("\n") +
-      `\n\n💰 Итого: ${formatMoney(total)}`
+    lines.join("\n") +
+    `\n\n💰 Итого: ${formatMoney(total)}`
   );
 });
 
-// /balance — расчёт взаиморасчётов
-bot.command("balance", async (ctx) => {
+// /balance
+bot.command("balance", async ctx => {
   const expenses = ctx.session.expenses;
   const participants = ctx.session.knownUsers;
 
-  if (expenses.length === 0) {
+  if (!expenses.length) {
     return ctx.reply("Список трат пуст.");
   }
 
-  if (participants.length === 0) {
-    return ctx.reply("Пока нет участников для расчёта.");
+  if (!participants.length) {
+    return ctx.reply("Нет участников для расчёта.");
   }
 
-  const totalCents = expenses.reduce(
-    (sum, expense) => sum + Math.round(expense.amount * 100),
-    0
+  const total = expenses.reduce(
+    (sum, e) => sum + Math.round(e.amount * 100), 0
   );
 
-  const shareCents = Math.round(totalCents / participants.length);
+  const share = Math.round(total / participants.length);
 
-  // Сколько каждый участник потратил
   const spent: Record<number, number> = {};
 
   for (const expense of expenses) {
@@ -312,13 +299,11 @@ bot.command("balance", async (ctx) => {
       Math.round(expense.amount * 100);
   }
 
-  // Положительный баланс — должен заплатить.
-  // Отрицательный баланс — должен получить.
   const debtors: { user: KnownUser; amount: number }[] = [];
   const creditors: { user: KnownUser; amount: number }[] = [];
 
   for (const user of participants) {
-    const balance = shareCents - (spent[user.userId] || 0);
+    const balance = share - (spent[user.userId] || 0);
 
     if (balance > 0) {
       debtors.push({ user, amount: balance });
@@ -327,9 +312,7 @@ bot.command("balance", async (ctx) => {
     }
   }
 
-  // Жадное сведение должников и кредиторов
   const transfers: string[] = [];
-
   let i = 0;
   let j = 0;
 
@@ -339,13 +322,11 @@ bot.command("balance", async (ctx) => {
       creditors[j].amount
     );
 
-    if (amount > 0) {
-      transfers.push(
-        `${getName(debtors[i].user.username)} → ` +
-          `${getName(creditors[j].user.username)}: ` +
-          `${formatMoney(amount / 100)}`
-      );
-    }
+    transfers.push(
+      `${getName(debtors[i].user.username)} → ` +
+      `${getName(creditors[j].user.username)}: ` +
+      `${formatMoney(amount / 100)}`
+    );
 
     debtors[i].amount -= amount;
     creditors[j].amount -= amount;
@@ -355,59 +336,51 @@ bot.command("balance", async (ctx) => {
   }
 
   let message =
-    `💰 Всего: ${formatMoney(totalCents / 100)}\n` +
+    `💰 Всего: ${formatMoney(total / 100)}\n` +
     `👥 Участников: ${participants.length}\n` +
-    `💸 С каждого: ${formatMoney(shareCents / 100)}\n\n`;
+    `💸 С каждого: ${formatMoney(share / 100)}\n\n`;
 
-  if (transfers.length === 0) {
-    message += "✅ Все в расчёте.";
-  } else {
-    message += "💳 Переводы:\n" + transfers.join("\n");
-  }
+  message += transfers.length
+    ? "💳 Переводы:\n" + transfers.join("\n")
+    : "✅ Все в расчёте.";
 
   await ctx.reply(message);
 });
 
-// /undo — удалить последнюю запись
-bot.command("undo", async (ctx) => {
+// /undo
+bot.command("undo", async ctx => {
   if (!isAdmin(ctx)) {
-    return ctx.reply("⛔ Эта команда доступна только администратору.");
+    return ctx.reply("⛔ Команда доступна только администратору.");
   }
 
-  const expenses = ctx.session.expenses;
+  const removed = ctx.session.expenses.pop();
 
-  if (expenses.length === 0) {
+  if (!removed) {
     return ctx.reply("Нечего отменять.");
   }
 
-  const removed = expenses.pop()!;
-
   await ctx.reply(
-    "↩️ Последняя запись отменена:\n\n" +
-      `${getName(removed.username)} — ` +
-      `${formatMoney(removed.amount)} (${removed.description})`
+    `↩️ Удалена запись:\n${getName(removed.username)} — ` +
+    `${formatMoney(removed.amount)} (${removed.description})`
   );
 });
 
-// /reset — очистить расходы
-bot.command("reset", async (ctx) => {
+// /reset
+bot.command("reset", async ctx => {
   if (!isAdmin(ctx)) {
-    return ctx.reply("⛔ Эта команда доступна только администратору.");
+    return ctx.reply("⛔ Команда доступна только администратору.");
   }
 
   ctx.session.expenses = [];
   ctx.session.nextId = 1;
 
   await ctx.reply(
-    "🧹 Все расходы удалены.\n" +
-      "Список участников сохранён.\n" +
-      "Можно начинать новый расчёт."
+    "🧹 Расходы удалены. Список участников сохранён."
   );
 });
 
-// Автоматическая запись расходов.
-// Все остальные сообщения игнорируются.
-bot.on("message:text", async (ctx) => {
+// Автоматическая запись расходов
+bot.on("message:text", async ctx => {
   const parsed = parseExpense(ctx.message.text);
 
   if (!parsed) return;
@@ -423,13 +396,16 @@ bot.on("message:text", async (ctx) => {
 
   await ctx.reply(
     `✅ Записал: ${getName(expense.username)} — ` +
-      `${formatMoney(expense.amount)} (${expense.description})`
+    `${formatMoney(expense.amount)} (${expense.description})`
   );
 });
 
-// Запуск
+bot.catch(err => {
+  console.error("Ошибка бота:", err);
+});
+
 bot.start({
-  onStart: (botInfo) => {
+  onStart: botInfo => {
     console.log(
       `Бот @${botInfo.username} запущен и слушает сообщения...`
     );

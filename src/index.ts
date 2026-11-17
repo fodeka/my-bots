@@ -96,4 +96,9 @@ bot.on("message:text", async (ctx) => {
   await ctx.reply("Я понимаю только команды /add, /split и /reset.");
 });
 
-bot.start();
+// Запуск бота с выводом в консоль
+bot.start({
+  onStart: (botInfo) => {
+    console.log(`Бот @${botInfo.username} запущен и слушает сообщения...`);
+  },
+});

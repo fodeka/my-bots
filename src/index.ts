@@ -2,6 +2,7 @@
 import { Bot, Context, session } from "grammy";
 import { FileAdapter } from "@grammyjs/storage-file";
 import { join } from "path";
+import { readdir } from "fs/promises";
 
 const ADMIN_USERNAME = "KlementyevDenis";
 
@@ -38,6 +39,11 @@ if (!token) {
 
 const bot = new Bot<MyContext>(token);
 
+// Единое хранилище для всех чатов
+const storage = new FileAdapter<SessionData>({
+  dirName: "sessions",
+});
+
 bot.use(
   session({
     initial: (): SessionData => ({
@@ -45,46 +51,75 @@ bot.use(
       knownUsers: [],
       nextId: 1,
     }),
-    storage: new FileAdapter({
-      dir: join(process.cwd(), "data"),
-    }),
+    storage,
     getSessionKey: (ctx) => ctx.chat?.id.toString(),
   })
 );
 
-// Миграция старых данных
-bot.use(async (ctx, next) => {
-  if (ctx.session) {
-    const data = ctx.session as SessionData;
-
-    if (!Array.isArray(data.expenses)) {
-      data.expenses = [];
-    }
-
-    if (!Array.isArray(data.knownUsers)) {
-      data.knownUsers = [];
-    }
-
-    data.expenses.forEach((expense, index) => {
-      if (!expense.id) expense.id = index + 1;
-      if (!expense.createdAt) {
-        expense.createdAt = new Date().toISOString();
-      }
-      if (!expense.source) expense.source = "auto";
-    });
-
-    const maxId = data.expenses.reduce(
-      (max, expense) => Math.max(max, expense.id),
-      0
-    );
-
-    if (!data.nextId || data.nextId <= maxId) {
-      data.nextId = maxId + 1;
-    }
+// Приведение старых данных к актуальному формату
+function normalizeSession(data: any): SessionData {
+  if (!data || typeof data !== "object") {
+    return {
+      expenses: [],
+      knownUsers: [],
+      nextId: 1,
+    };
   }
 
+  if (!Array.isArray(data.expenses)) {
+    data.expenses = [];
+  }
+
+  if (!Array.isArray(data.knownUsers)) {
+    data.knownUsers = [];
+  }
+
+  data.expenses.forEach((expense: any, index: number) => {
+    if (!expense.id) expense.id = index + 1;
+
+    if (!expense.createdAt) {
+      expense.createdAt = new Date().toISOString();
+    }
+
+    if (!expense.source) {
+      expense.source = "auto";
+    }
+  });
+
+  const maxId = data.expenses.reduce(
+    (max: number, expense: Expense) =>
+      Math.max(max, expense.id),
+    0
+  );
+
+  if (
+    !Number.isFinite(data.nextId) ||
+    data.nextId <= maxId
+  ) {
+    data.nextId = maxId + 1;
+  }
+
+  return data as SessionData;
+}
+
+// Миграция данных при обычной работе бота
+bot.use(async (ctx, next) => {
+  ctx.session = normalizeSession(ctx.session);
   await next();
 });
+
+// Проверка администратора
+function isAdmin(ctx: MyContext): boolean {
+  return (
+    ctx.from?.username?.toLowerCase() ===
+    ADMIN_USERNAME.toLowerCase()
+  );
+}
+
+// Административные команды разрешены только в личном чате
+function isPrivateAdmin(ctx: MyContext): boolean {
+  return isAdmin(ctx) && ctx.chat?.type === "private";
+}
 
 function formatMoney(amount: number): string {
   return new Intl.NumberFormat("ru-RU", {
@@ -94,16 +129,15 @@ function formatMoney(amount: number): string {
 }
 
 function getName(username: string): string {
-  return username.startsWith("@") ? username : `@${username}`;
-}
-
-function isAdmin(ctx: MyContext): boolean {
-  return ctx.from?.username?.toLowerCase() ===
-    ADMIN_USERNAME.toLowerCase();
+  return username.startsWith("@")
+    ? username
+    : `@${username}`;
 }
 
 function parseExpense(text: string) {
-  const match = text.trim().match(/^(\d+(?:[.,]\d+)?)\s+(.+)$/);
+  const match = text.trim().match(
+    /^(\d+(?:[.,]\d+)?)\s+(.+)$/
+  );
 
   if (!match) return null;
 
@@ -118,7 +152,7 @@ function parseExpense(text: string) {
 }
 
 function addExpense(
-  ctx: MyContext,
+  data: SessionData,
   amount: number,
   description: string,
   userId: number,
@@ -126,7 +160,7 @@ function addExpense(
   source: "auto" | "add" | "import"
 ): Expense {
   const expense: Expense = {
-    id: ctx.session.nextId++,
+    id: data.nextId++,
     amount: Math.round(amount * 100) / 100,
     description: description.trim(),
     userId,
@@ -135,7 +169,8 @@ function addExpense(
     source,
   };
 
-  ctx.session.expenses.push(expense);
+  data.expenses.push(expense);
+
   return expense;
 }
 
@@ -143,8 +178,11 @@ function addExpense(
 bot.use(async (ctx, next) => {
   if (ctx.from && ctx.chat) {
     const userId = ctx.from.id;
-    const username = ctx.from.username ||
-      ctx.from.first_name || String(userId);
+
+    const username =
+      ctx.from.username ||
+      ctx.from.first_name ||
+      String(userId);
 
     const existing = ctx.session.knownUsers.find(
       user => user.userId === userId
@@ -153,25 +191,122 @@ bot.use(async (ctx, next) => {
     if (existing) {
       existing.username = username;
     } else {
-      ctx.session.knownUsers.push({ userId, username });
+      ctx.session.knownUsers.push({
+        userId,
+        username,
+      });
     }
   }
 
   await next();
 });
 
+// Получение списка всех существующих баз
+async function getAllSessions(): Promise<
+  { chatId: string; data: SessionData }[]
+> {
+  const root = join(process.cwd(), "sessions");
+  const result: {
+    chatId: string;
+    data: SessionData;
+  }[] = [];
+
+  let folders;
+
+  try {
+    folders = await readdir(root, {
+      withFileTypes: true,
+    });
+  } catch {
+    return result;
+  }
+
+  for (const folder of folders) {
+    if (!folder.isDirectory()) continue;
+
+    const folderPath = join(root, folder.name);
+
+    let files;
+
+    try {
+      files = await readdir(folderPath);
+    } catch {
+      continue;
+    }
+
+    for (const file of files) {
+      if (!file.endsWith(".json")) continue;
+
+      const chatId = file.slice(0, -5);
+
+      if (!/^-?\d+$/.test(chatId)) continue;
+
+      try {
+        const data = await storage.read(chatId);
+
+        if (data) {
+          result.push({
+            chatId,
+            data: normalizeSession(data),
+          });
+        }
+      } catch (error) {
+        console.error(
+          `Ошибка чтения базы ${chatId}:`,
+          error
+        );
+      }
+    }
+  }
+
+  return result;
+}
+
+// Чтение выбранной базы
+async function getTargetSession(
+  ctx: MyContext,
+  chatId: string
+): Promise<SessionData | null> {
+  // Если работаем с текущим чатом,
+  // используем уже загруженную сессию
+  if (ctx.chat?.id.toString() === chatId) {
+    return ctx.session;
+  }
+
+  const data = await storage.read(chatId);
+
+  if (!data) return null;
+
+  return normalizeSession(data);
+}
+
+// Сохранение выбранной базы
+async function saveTargetSession(
+  ctx: MyContext,
+  chatId: string,
+  data: SessionData
+): Promise<void> {
+  // Текущую сессию сохранит middleware grammY
+  if (ctx.chat?.id.toString() === chatId) {
+    return;
+  }
+
+  await storage.write(chatId, data);
+}
+
 // /start
 bot.command("start", async ctx => {
   await ctx.reply(
     "Привет! Я бот для учёта общих расходов.\n\n" +
-    "Просто отправляй сообщение:\n100 Такси\n\n" +
+    "Просто отправляй сообщение:\n" +
+    "100 Такси\n\n" +
     "Команда /help — список возможностей."
   );
 });
 
 // /help
 bot.command("help", async ctx => {
-  await ctx.reply(
+  let message =
     "📋 Команды бота:\n\n" +
     "Автоматическая запись: 100 Такси\n" +
     "Добавить: /add 500 Такси\n" +
@@ -179,9 +314,21 @@ bot.command("help", async ctx => {
     "Расчёт: /balance\n" +
     "История: /list\n" +
     "Отмена последней записи: /undo\n" +
-    "Сброс расходов: /reset\n\n" +
-    "Обычные сообщения игнорируются."
-  );
+    "Сброс расходов: /reset";
+
+  if (isAdmin(ctx)) {
+    message +=
+      "\n\n🛠 Администрирование:\n" +
+      "/admin\n" +
+      "/addto ID 500 Такси\n" +
+      "/addto ID @username 500 Такси\n" +
+      "/listto ID\n" +
+      "/resetto ID confirm";
+  }
+
+  message += "\n\nОбычные сообщения игнорируются.";
+
+  await ctx.reply(message);
 });
 
 // /add
@@ -193,7 +340,7 @@ bot.command("add", async ctx => {
   }
 
   const expense = addExpense(
-    ctx,
+    ctx.session,
     parsed.amount,
     parsed.description,
     ctx.from.id,
@@ -210,7 +357,9 @@ bot.command("add", async ctx => {
 // /import
 bot.command("import", async ctx => {
   if (!isAdmin(ctx)) {
-    return ctx.reply("⛔ Команда доступна только администратору.");
+    return ctx.reply(
+      "⛔ Команда доступна только администратору."
+    );
   }
 
   const match = ctx.match.trim().match(
@@ -218,24 +367,31 @@ bot.command("import", async ctx => {
   );
 
   if (!match) {
-    return ctx.reply("Пример: /import @username 500 Такси");
+    return ctx.reply(
+      "Пример: /import @username 500 Такси"
+    );
   }
 
   const username = match[1].replace("@", "");
   const amount = Number(match[2].replace(",", "."));
   const description = match[3].trim();
 
-  if (!Number.isFinite(amount) || amount <= 0 || !description) {
+  if (
+    !Number.isFinite(amount) ||
+    amount <= 0 ||
+    !description
+  ) {
     return ctx.reply("⛔ Проверьте сумму и описание.");
   }
 
   const user = ctx.session.knownUsers.find(
-    u => u.username.replace("@", "").toLowerCase() ===
+    u =>
+      u.username.replace("@", "").toLowerCase() ===
       username.toLowerCase()
   );
 
   const expense = addExpense(
-    ctx,
+    ctx.session,
     amount,
     description,
     user?.userId ?? 0,
@@ -259,11 +415,15 @@ bot.command("list", async ctx => {
   }
 
   const lines = expenses.map(e =>
-    `${e.id}. ${getName(e.username)}: ${formatMoney(e.amount)} — ` +
+    `${e.id}. ${getName(e.username)}: ` +
+    `${formatMoney(e.amount)} — ` +
     `${e.description}${e.source === "import" ? " (+импорт)" : ""}`
   );
 
-  const total = expenses.reduce((sum, e) => sum + e.amount, 0);
+  const total = expenses.reduce(
+    (sum, e) => sum + e.amount,
+    0
+  );
 
   await ctx.reply(
     "📋 История расходов:\n\n" +
@@ -286,10 +446,13 @@ bot.command("balance", async ctx => {
   }
 
   const total = expenses.reduce(
-    (sum, e) => sum + Math.round(e.amount * 100), 0
+    (sum, e) => sum + Math.round(e.amount * 100),
+    0
   );
 
-  const share = Math.round(total / participants.length);
+  const share = Math.round(
+    total / participants.length
+  );
 
   const spent: Record<number, number> = {};
 
@@ -299,24 +462,39 @@ bot.command("balance", async ctx => {
       Math.round(expense.amount * 100);
   }
 
-  const debtors: { user: KnownUser; amount: number }[] = [];
-  const creditors: { user: KnownUser; amount: number }[] = [];
+  const debtors: {
+    user: KnownUser;
+    amount: number;
+  }[] = [];
+
+  const creditors: {
+    user: KnownUser;
+    amount: number;
+  }[] = [];
 
   for (const user of participants) {
-    const balance = share - (spent[user.userId] || 0);
+    const balance =
+      share - (spent[user.userId] || 0);
 
     if (balance > 0) {
       debtors.push({ user, amount: balance });
     } else if (balance < 0) {
-      creditors.push({ user, amount: -balance });
+      creditors.push({
+        user,
+        amount: -balance,
+      });
     }
   }
 
   const transfers: string[] = [];
+
   let i = 0;
   let j = 0;
 
-  while (i < debtors.length && j < creditors.length) {
+  while (
+    i < debtors.length &&
+    j < creditors.length
+  ) {
     const amount = Math.min(
       debtors[i].amount,
       creditors[j].amount
@@ -350,7 +528,9 @@ bot.command("balance", async ctx => {
 // /undo
 bot.command("undo", async ctx => {
   if (!isAdmin(ctx)) {
-    return ctx.reply("⛔ Команда доступна только администратору.");
+    return ctx.reply(
+      "⛔ Команда доступна только администратору."
+    );
   }
 
   const removed = ctx.session.expenses.pop();
@@ -368,7 +548,9 @@ bot.command("undo", async ctx => {
 // /reset
 bot.command("reset", async ctx => {
   if (!isAdmin(ctx)) {
-    return ctx.reply("⛔ Команда доступна только администратору.");
+    return ctx.reply(
+      "⛔ Команда доступна только администратору."
+    );
   }
 
   ctx.session.expenses = [];
@@ -379,14 +561,295 @@ bot.command("reset", async ctx => {
   );
 });
 
-// Автоматическая запись расходов
+// ======================================
+// АДМИНИСТРАТИВНЫЕ КОМАНДЫ
+// Доступны только администратору в личном чате
+// ======================================
+
+// /admin
+bot.command("admin", async ctx => {
+  if (!isPrivateAdmin(ctx)) {
+    return ctx.reply(
+      "⛔ Команда доступна только администратору в личном чате."
+    );
+  }
+
+  const sessions = await getAllSessions();
+
+  if (!sessions.length) {
+    return ctx.reply("Базы данных не найдены.");
+  }
+
+  const lines: string[] = [
+    "🛠 Администрирование\n",
+  ];
+
+  let totalExpenses = 0;
+  let totalAmount = 0;
+
+  for (let i = 0; i < sessions.length; i++) {
+    const item = sessions[i];
+
+    const chatId = Number(item.chatId);
+    const data = item.data;
+
+    let chatName = "Название неизвестно";
+    let chatType = "неизвестно";
+
+    try {
+      const chat = await bot.api.getChat(chatId);
+
+      chatType = chat.type;
+
+      if ("title" in chat && chat.title) {
+        chatName = chat.title;
+      } else if ("first_name" in chat) {
+        chatName = chat.first_name;
+      } else if ("username" in chat && chat.username) {
+        chatName = "@" + chat.username;
+      }
+    } catch {
+      chatName = "Не удалось получить название";
+    }
+
+    const amount = data.expenses.reduce(
+      (sum, e) => sum + e.amount,
+      0
+    );
+
+    totalExpenses += data.expenses.length;
+    totalAmount += amount;
+
+    lines.push(
+      `${i + 1}. ${chatName}\n` +
+      `Тип: ${chatType}\n` +
+      `ID: ${item.chatId}\n` +
+      `Участников: ${data.knownUsers.length}\n` +
+      `Расходов: ${data.expenses.length}\n` +
+      `Сумма: ${formatMoney(amount)} ₽\n`
+    );
+  }
+
+  lines.push(
+    "──────────────\n" +
+    `Всего баз: ${sessions.length}\n` +
+    `Всего расходов: ${totalExpenses}\n` +
+    `Общая сумма: ${formatMoney(totalAmount)} ₽`
+  );
+
+  await ctx.reply(lines.join("\n"));
+});
+
+// /addto
+// Формат:
+// /addto ID 500 Такси
+// /addto ID @username 500 Такси
+
+bot.command("addto", async ctx => {
+  if (!isPrivateAdmin(ctx)) {
+    return ctx.reply(
+      "⛔ Команда доступна только администратору в личном чате."
+    );
+  }
+
+  const match = ctx.match.trim().match(
+    /^(-?\d+)\s+(?:(@\S+)\s+)?(\d+(?:[.,]\d+)?)\s+(.+)$/
+  );
+
+  if (!match) {
+    return ctx.reply(
+      "Примеры:\n" +
+      "/addto -5322275256 500 Такси\n" +
+      "/addto -5322275256 @username 500 Такси"
+    );
+  }
+
+  const chatId = match[1];
+  const targetUsername = match[2]
+    ? match[2].replace("@", "")
+    : null;
+
+  const amount = Number(
+    match[3].replace(",", ".")
+  );
+
+  const description = match[4].trim();
+
+  if (
+    !Number.isFinite(amount) ||
+    amount <= 0 ||
+    !description
+  ) {
+    return ctx.reply("⛔ Проверьте сумму и описание.");
+  }
+
+  const data = await getTargetSession(ctx, chatId);
+
+  if (!data) {
+    return ctx.reply(
+      `⛔ База ${chatId} не найдена.`
+    );
+  }
+
+  let userId: number;
+  let username: string;
+
+  if (targetUsername) {
+    const user = data.knownUsers.find(
+      u =>
+        u.username.replace("@", "").toLowerCase() ===
+        targetUsername.toLowerCase()
+    );
+
+    userId = user?.userId ?? 0;
+    username = targetUsername;
+  } else {
+    userId = ctx.from.id;
+    username =
+      ctx.from.username ||
+      ctx.from.first_name ||
+      String(ctx.from.id);
+  }
+
+  const expense = addExpense(
+    data,
+    amount,
+    description,
+    userId,
+    username,
+    "add"
+  );
+
+  await saveTargetSession(ctx, chatId, data);
+
+  await ctx.reply(
+    `✅ Добавлено в базу ${chatId}:\n` +
+    `${getName(expense.username)} — ` +
+    `${formatMoney(expense.amount)} ₽ ` +
+    `(${expense.description})`
+  );
+});
+
+// /listto
+// Формат: /listto ID
+
+bot.command("listto", async ctx => {
+  if (!isPrivateAdmin(ctx)) {
+    return ctx.reply(
+      "⛔ Команда доступна только администратору в личном чате."
+    );
+  }
+
+  const match = ctx.match.trim().match(
+    /^(-?\d+)$/
+  );
+
+  if (!match) {
+    return ctx.reply(
+      "Пример: /listto -5322275256"
+    );
+  }
+
+  const chatId = match[1];
+
+  const data = await getTargetSession(ctx, chatId);
+
+  if (!data) {
+    return ctx.reply(
+      `⛔ База ${chatId} не найдена.`
+    );
+  }
+
+  if (!data.expenses.length) {
+    return ctx.reply(
+      `📋 База ${chatId}\n\nСписок трат пуст.`
+    );
+  }
+
+  const lines = data.expenses.map(e =>
+    `${e.id}. ${getName(e.username)}: ` +
+    `${formatMoney(e.amount)} — ` +
+    `${e.description}` +
+    `${e.source === "import" ? " (+импорт)" : ""}`
+  );
+
+  const total = data.expenses.reduce(
+    (sum, e) => sum + e.amount,
+    0
+  );
+
+  await ctx.reply(
+    `📋 История расходов: ${chatId}\n\n` +
+    lines.join("\n") +
+    `\n\n💰 Итого: ${formatMoney(total)} ₽`
+  );
+});
+
+// /resetto
+// Формат: /resetto ID confirm
+
+bot.command("resetto", async ctx => {
+  if (!isPrivateAdmin(ctx)) {
+    return ctx.reply(
+      "⛔ Команда доступна только администратору в личном чате."
+    );
+  }
+
+  const match = ctx.match.trim().match(
+    /^(-?\d+)(?:\s+(\S+))?$/
+  );
+
+  if (!match) {
+    return ctx.reply(
+      "Пример: /resetto -5322275256 confirm"
+    );
+  }
+
+  const chatId = match[1];
+  const confirmation = match[2];
+
+  if (confirmation !== "confirm") {
+    return ctx.reply(
+      "⚠️ Для подтверждения удаления отправьте:\n" +
+      `/resetto ${chatId} confirm\n\n` +
+      "Все расходы выбранной базы будут удалены. " +
+      "Список участников сохранится."
+    );
+  }
+
+  const data = await getTargetSession(ctx, chatId);
+
+  if (!data) {
+    return ctx.reply(
+      `⛔ База ${chatId} не найдена.`
+    );
+  }
+
+  const removedCount = data.expenses.length;
+
+  data.expenses = [];
+  data.nextId = 1;
+
+  await saveTargetSession(ctx, chatId, data);
+
+  await ctx.reply(
+    `🧹 База ${chatId} очищена.\n` +
+    `Удалено расходов: ${removedCount}\n` +
+    `Участников сохранено: ${data.knownUsers.length}`
+  );
+});
+
+// ======================================
+// АВТОМАТИЧЕСКАЯ ЗАПИСЬ РАСХОДОВ
+// ======================================
+
 bot.on("message:text", async ctx => {
   const parsed = parseExpense(ctx.message.text);
 
   if (!parsed) return;
 
   const expense = addExpense(
-    ctx,
+    ctx.session,
     parsed.amount,
     parsed.description,
     ctx.from.id,
@@ -400,10 +863,12 @@ bot.on("message:text", async ctx => {
   );
 });
 
+// Обработка ошибок
 bot.catch(err => {
   console.error("Ошибка бота:", err);
 });
 
+// Запуск
 bot.start({
   onStart: botInfo => {
     console.log(
